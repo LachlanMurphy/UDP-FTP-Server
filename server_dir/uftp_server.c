@@ -13,6 +13,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <sys/time.h>
+#include <errno.h>
 
 #define BUFSIZE 1024
 
@@ -24,7 +26,7 @@ void error(char *msg) {
 	exit(1);
 }
 
-// sends a packet to a client
+// sends a packet to an adress
 int sendPacket(char* buf, int len, int sock_fd, struct sockaddr_in * clientaddr, int clientlen);
 
 
@@ -149,6 +151,92 @@ int main(int argc, char **argv) {
 				sendPacket("END", strlen("END"), sockfd, &clientaddr, clientlen);
 				fclose(file);
 			}
+		} else if (!strncmp(buf, "put", strlen("put"))) {
+			// extract file name
+			char file_name[256];
+			int delimiter = strcspn(buf, " \n\0");
+			strncpy(file_name, buf+delimiter+1, strlen(buf+delimiter+1)+1);
+
+			// create file
+			FILE* file = fopen(file_name, "w");
+			if (!file) {
+				error("Error creating new file (PUT)");
+			}
+
+			// create timeout for client response
+			struct timeval tv;
+			tv.tv_sec = 2; // 2 second time out
+			tv.tv_usec = 0;
+			if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval *) &tv, sizeof(struct timeval)) < 0) {
+				error("ERROR in setsockopt");
+				exit(-1);
+			}
+
+			int ack = 0;
+			// start listening for packets
+			// loop because there may be multiple packets
+			while (1) {
+				// clear buffer
+				bzero(buf, BUFSIZE);
+
+				// send ack if not already sent
+				if (!ack) {
+					sendPacket("PUT_ACK", strlen("PUT_ACK"), sockfd, &clientaddr, clientlen);
+					ack = 1;
+				}
+
+				// await response
+				n = recvfrom(sockfd, buf, BUFSIZE, 0, (struct sockaddr *) &clientaddr, (socklen_t *) &clientlen);
+
+				// check if err or timeout occured
+				if (n < 0) {
+					// check if timoeut
+					if (errno == EAGAIN || errno == EWOULDBLOCK) {
+						// timeout reached
+						fprintf(stderr, "Client Timed out\n");
+						break;
+					} else {
+						// other err
+						error("ERROR in recvfrom");
+					}
+				} else {
+					// check if END is recieved
+					if (!strncmp(buf, "END", strlen("END"))) {
+						fclose(file);
+
+						// send END back to client
+						sendPacket("END", strlen("END"), sockfd, &clientaddr, clientlen);
+						break;
+					}
+
+					// write to file
+					fwrite(buf, n, 1, file);
+				}
+			}
+
+			// reset socket timeout
+			tv.tv_sec = 0;
+			if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval *) &tv, sizeof(struct timeval)) < 0) {
+				error("ERROR in setsockopt");
+				exit(-1);
+			}
+		} else if (!strncmp(buf, "delete", strlen("delete"))) {
+			// extract file name
+			char file_name[256];
+			int delimiter = strcspn(buf, " \n\0");
+			strncpy(file_name, buf+delimiter+1, strlen(buf+delimiter+1)+1);
+
+			// check if file exists
+			if (!access(file_name, F_OK)) {
+				// file exists
+				if (!remove(file_name)) {
+					sendPacket("END", strlen("END"), sockfd, &clientaddr, clientlen);
+				} else {
+					sendPacket("DELETE_ERR", strlen("DELETE_ERR"), sockfd, &clientaddr, clientlen);
+				}
+			} else {
+				sendPacket("DELETE_ERR", strlen("DELETE_ERR"), sockfd, &clientaddr, clientlen);
+			}
 		} else {
 			// command does not exist, shouldn't happen but
 			// its best to put the edge case here
@@ -160,8 +248,9 @@ int main(int argc, char **argv) {
 // sends a packet, resends if all bytes were not sent
 int sendPacket(char* buf, int len, int sock_fd, struct sockaddr_in * clientaddr, int clientlen) {
 	int n = 0;
-	
+	int count = 0;
 	while (n < len){
+		printf("%d\n", ++count);
 		int sent = sendto(sock_fd, buf+n, len-n, 0, (struct sockaddr *) clientaddr, clientlen);
 		if (sent < 0) error("ERROR in sendto");
 
