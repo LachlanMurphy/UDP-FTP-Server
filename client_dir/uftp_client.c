@@ -2,6 +2,10 @@
  * udpclient.c - A simple UDP client
  * usage: udpclient <host> <port>
  */
+
+// Author: Lachlan Murphy
+// 2 February 2025
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,10 +38,13 @@ enum Message_t {
 };
 
 // sends a packet to an adress
-int sendPacket(char* buf, int len, int sock_fd, struct sockaddr_in * clientaddr, int clientlen);
+int sendPacket(char* buf, int len, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int byte_num);
 
 // sends a file to the server
-int sendFile();
+int sendFile(FILE* file, char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int* byte_num);
+
+// gets packet from server
+int getPacket(char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int byte_num);
 
 int main(int argc, char **argv) {
     int sockfd, portno, n;
@@ -74,7 +81,11 @@ int main(int argc, char **argv) {
     serveraddr.sin_port = htons(portno);
 
     /* get a message from the user */
+	int get_byte_order;
+	int send_byte_order;
     get_usr: // return label for when previous request completes
+	get_byte_order = 0;
+	send_byte_order = 0;
     bzero(buf, BUFSIZE);
     printf("Please enter msg: ");
     fgets(buf, BUFSIZE, stdin);
@@ -129,8 +140,7 @@ int main(int argc, char **argv) {
 
     /* send the message to the server */
     serverlen = sizeof(serveraddr);
-    n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *) &serveraddr, serverlen);
-    if (n < 0) error("ERROR in sendto");
+	n = sendPacket(buf, strlen(buf), sockfd, &serveraddr, serverlen, send_byte_order++);
 
     
     // set timeout
@@ -149,20 +159,12 @@ int main(int argc, char **argv) {
 		// reset buffer
 		bzero(buf, BUFSIZE);
 		
-		n = recvfrom(sockfd, buf, BUFSIZE, 0, (struct sockaddr *) &serveraddr, (socklen_t *) &serverlen);
+		// get packet
+		n = getPacket(buf, sockfd, &serveraddr, serverlen, get_byte_order++);
 
 		// check if err or timeout occured
 		if (n < 0) {
-
-			// check if timoeut
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				// timeout reached
-				fprintf(stderr, "Client Timed out\n");
-				goto get_usr;
-			} else {
-				// other err
-				error("ERROR in recvfrom");
-			}
+			goto get_usr;
 		} else {
 			// packet recieved
 
@@ -175,6 +177,7 @@ int main(int argc, char **argv) {
 				// if end signal given, end seeking for this stream of packets
 				if (!strcmp(buf, "END")) {
 					// run what each message type's end
+					// garbage collection pretty much
 					switch (type) {
 						case LS: {
 							printf("\n");
@@ -220,7 +223,7 @@ int main(int argc, char **argv) {
 						} else {
 							// send data to server
 							// integrity of file has already been checked
-							sendFile(rw_fd, buf, sockfd, &serveraddr, serverlen);
+							sendFile(rw_fd, buf, sockfd, &serveraddr, serverlen, &send_byte_order);
 						}
 					} break;
 					case DELETE: {
@@ -238,20 +241,77 @@ int main(int argc, char **argv) {
 }
 
 // sends a packet, resends if all bytes were not sent
-int sendPacket(char* buf, int len, int sock_fd, struct sockaddr_in * clientaddr, int clientlen) {
-	int n = 0;
-	
-	while (n < len){
-		int sent = sendto(sock_fd, buf+n, len-n, 0, (struct sockaddr *) clientaddr, clientlen);
-		if (sent < 0) error("ERROR in sendto");
+int sendPacket(char* buf, int len, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int byte_num) {
+	char ack_buf[256]; // buffer to get ack
+	char send_buf[BUFSIZE+4]; // extra four bytes to hold packet number
+	int count = 0; // # of times we try to resend the data
 
-		n += sent;
+	// init send buffer
+	memcpy(send_buf, buf, len);
+
+	// add byte number to buffer
+	send_buf[len++] = (char) (byte_num >> 3);
+	send_buf[len++] = (char) (byte_num >> 2);
+	send_buf[len++] = (char) (byte_num >> 1);
+	send_buf[len++] = (char) (byte_num);
+
+	// set timeout for recvfrom
+	struct timeval tv;
+	tv.tv_sec = 0;
+	tv.tv_usec = 500000; // half a seocond
+	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval *) &tv, sizeof(struct timeval)) < 0) {
+		error("ERROR in setsockopt");
+	}
+
+	// for debugging
+	// printf("Sending packet %d %s\n", byte_num, send_buf);
+
+	// send packet
+	send_packet_lbl:
+	sendto(sockfd, send_buf, len, 0, (struct sockaddr *) clientaddr, clientlen);
+	
+	// wait for ACK from other computer
+	socklen_t socklen = sizeof(clientaddr);
+	int n = recvfrom(sockfd, ack_buf, sizeof(ack_buf), 0, (struct sockaddr *) &clientaddr, &socklen);
+	
+	if (n < 0) {
+		// check if timoeut
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			// timeout reached
+			// could have been a packet loss, retry unless too many
+			if (++count > 5) {
+				tv.tv_usec = 0;
+				if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval *) &tv, sizeof(struct timeval)) < 0) {
+					error("ERROR in setsockopt");
+				}
+				return -1;
+			}
+			
+			goto send_packet_lbl;
+		} else {
+			// other err
+			error("ERROR in recvfrom");
+		}
+	}
+
+	// make sure the ACK was recieved
+	if (!strncmp(ack_buf, "GEN_ACK", strlen("GEN_ACK"))) {
+		tv.tv_usec = 0;
+		if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval *) &tv, sizeof(struct timeval)) < 0) {
+			error("ERROR in setsockopt");
+		}
+	}
+	
+	// reset socket timeout
+	tv.tv_usec = 0;
+	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (struct timeval *) &tv, sizeof(struct timeval)) < 0) {
+		error("ERROR in setsockopt");
 	}
 
 	return n;
 }
 
-int sendFile(FILE* file, char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen) {
+int sendFile(FILE* file, char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int* byte_num) {
 
 	// n keeps track of how many bytes we have sent so far in the file
 	int n = 0;
@@ -259,8 +319,43 @@ int sendFile(FILE* file, char* buf, int sockfd, struct sockaddr_in * clientaddr,
 		n = fread(buf, 1, BUFSIZE, file);
 		if (n <= 0) break;
 
-		sendPacket(buf, n, sockfd, clientaddr, clientlen);
+		sendPacket(buf, n, sockfd, clientaddr, clientlen, (*byte_num)++);
 	}
-	sendPacket("END", strlen("END"), sockfd, clientaddr, clientlen);\
+	sendPacket("END", strlen("END"), sockfd, clientaddr, clientlen, (*byte_num)++);
 	return n;
+}
+
+int getPacket(char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int byte_num) {
+	int r_byte_num; // recieving pack #
+	int n; // # of bytes recieved
+	char get_buf[BUFSIZE+4]; // buffer to get data
+	do {
+		n = recvfrom(sockfd, get_buf, BUFSIZE + 4, 0, (struct sockaddr *) clientaddr, (socklen_t *) &clientlen);
+		
+		if (n < 0) {
+			// check if timoeut
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				printf("Server timed out\n");
+				return -1;
+			} else {
+				// other err
+				error("ERROR in recvfrom");
+			}
+		}
+
+		// send ack
+		sendto(sockfd, "GEN_ACK", strlen("GEN_ACK"), 0, (struct sockaddr *) clientaddr, clientlen);
+		
+		// get byte number from packet
+		r_byte_num = (get_buf[n-4] << 3) | (get_buf[n-3] << 2) | (get_buf[n-2] << 1) | get_buf[n-1];
+		
+		// for debugging
+		// printf("%s Got packet with number %d == %d with %d\n", get_buf, r_byte_num, byte_num, n);
+	
+	} while (r_byte_num != byte_num);
+
+	// copy over actual data to given buffer
+	memcpy(buf, get_buf, n-4);
+
+	return n-4; // to correct for the byte number, no longer needed
 }
