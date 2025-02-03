@@ -38,13 +38,13 @@ enum Message_t {
 };
 
 // sends a packet to an adress
-int sendPacket(char* buf, int len, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int byte_num);
+int sendPacket(char* buf, int len, int sockfd, struct sockaddr_in * clientaddr, int clientlen, unsigned int byte_num);
 
 // sends a file to the server
-int sendFile(FILE* file, char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int* byte_num);
+int sendFile(FILE* file, char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, unsigned int* byte_num);
 
 // gets packet from server
-int getPacket(char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int byte_num);
+int getPacket(char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, unsigned int byte_num);
 
 int main(int argc, char **argv) {
     int sockfd, portno, n;
@@ -81,8 +81,8 @@ int main(int argc, char **argv) {
     serveraddr.sin_port = htons(portno);
 
     /* get a message from the user */
-	int get_byte_order;
-	int send_byte_order;
+	unsigned int get_byte_order;
+	unsigned int send_byte_order;
     get_usr: // return label for when previous request completes
 	get_byte_order = 0;
 	send_byte_order = 0;
@@ -129,8 +129,11 @@ int main(int argc, char **argv) {
 		type = GET;
 
 		// open new file as write
+
 		if ((rw_fd = fopen(file_name, "w")) == NULL) {
-			error("ERROR with fopen (GET)");
+			// file does not exist
+			printf("File %s does not exist.\n", file_name);
+			goto get_usr;
 		}
     } else {
 		// non valid input
@@ -241,7 +244,7 @@ int main(int argc, char **argv) {
 }
 
 // sends a packet, resends if all bytes were not sent
-int sendPacket(char* buf, int len, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int byte_num) {
+int sendPacket(char* buf, int len, int sockfd, struct sockaddr_in * clientaddr, int clientlen, unsigned int byte_num) {
 	char ack_buf[256]; // buffer to get ack
 	char send_buf[BUFSIZE+4]; // extra four bytes to hold packet number
 	int count = 0; // # of times we try to resend the data
@@ -250,10 +253,8 @@ int sendPacket(char* buf, int len, int sockfd, struct sockaddr_in * clientaddr, 
 	memcpy(send_buf, buf, len);
 
 	// add byte number to buffer
-	send_buf[len++] = (char) (byte_num >> 3);
-	send_buf[len++] = (char) (byte_num >> 2);
-	send_buf[len++] = (char) (byte_num >> 1);
-	send_buf[len++] = (char) (byte_num);
+	// *((unsigned int *) send_buf + len) = byte_num;
+	memcpy(send_buf+len, &byte_num, sizeof(int));
 
 	// set timeout for recvfrom
 	struct timeval tv;
@@ -264,11 +265,11 @@ int sendPacket(char* buf, int len, int sockfd, struct sockaddr_in * clientaddr, 
 	}
 
 	// for debugging
-	// printf("Sending packet %d %s\n", byte_num, send_buf);
+	// printf("Sending packet %d %d %d\n", byte_num, *((unsigned int *) send_buf + len), len);
 
 	// send packet
 	send_packet_lbl:
-	sendto(sockfd, send_buf, len, 0, (struct sockaddr *) clientaddr, clientlen);
+	sendto(sockfd, send_buf, len+sizeof(unsigned int), 0, (struct sockaddr *) clientaddr, clientlen);
 	
 	// wait for ACK from other computer
 	socklen_t socklen = sizeof(clientaddr);
@@ -311,7 +312,7 @@ int sendPacket(char* buf, int len, int sockfd, struct sockaddr_in * clientaddr, 
 	return n;
 }
 
-int sendFile(FILE* file, char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int* byte_num) {
+int sendFile(FILE* file, char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, unsigned int* byte_num) {
 
 	// n keeps track of how many bytes we have sent so far in the file
 	int n = 0;
@@ -325,8 +326,8 @@ int sendFile(FILE* file, char* buf, int sockfd, struct sockaddr_in * clientaddr,
 	return n;
 }
 
-int getPacket(char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, int byte_num) {
-	int r_byte_num; // recieving pack #
+int getPacket(char* buf, int sockfd, struct sockaddr_in * clientaddr, int clientlen, unsigned int byte_num) {
+	unsigned int r_byte_num; // recieving pack #
 	int n; // # of bytes recieved
 	char get_buf[BUFSIZE+4]; // buffer to get data
 	do {
@@ -335,7 +336,7 @@ int getPacket(char* buf, int sockfd, struct sockaddr_in * clientaddr, int client
 		if (n < 0) {
 			// check if timoeut
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				printf("Server timed out\n");
+				fprintf(stderr, "Server timed out\n");
 				return -1;
 			} else {
 				// other err
@@ -347,10 +348,10 @@ int getPacket(char* buf, int sockfd, struct sockaddr_in * clientaddr, int client
 		sendto(sockfd, "GEN_ACK", strlen("GEN_ACK"), 0, (struct sockaddr *) clientaddr, clientlen);
 		
 		// get byte number from packet
-		r_byte_num = (get_buf[n-4] << 3) | (get_buf[n-3] << 2) | (get_buf[n-2] << 1) | get_buf[n-1];
-		
+		memcpy(&r_byte_num, get_buf+n-4, sizeof(int));
+
 		// for debugging
-		// printf("%s Got packet with number %d == %d with %d\n", get_buf, r_byte_num, byte_num, n);
+		// printf("Got packet with number %d == %d with %d\n", r_byte_num, byte_num, n);
 	
 	} while (r_byte_num != byte_num);
 
